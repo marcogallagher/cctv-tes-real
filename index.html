@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CCTV HP</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<style>
+  body {
+    margin: 0;
+    background: #0a0a0a;
+    color: #e5e5e5;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  .wrap {
+    position: relative;
+    width: 100%;
+    max-width: 500px;
+  }
+  video, #overlay {
+    width: 100%;
+    border-radius: 12px;
+  }
+  video {
+    border: 2px solid #333;
+  }
+  #overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+  }
+  #status {
+    margin-top: 16px;
+    font-size: 14px;
+    color: #888;
+    text-align: center;
+  }
+  button {
+    margin-top: 16px;
+    padding: 10px 20px;
+    background: #2563eb;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:disabled {
+    background: #444;
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <video id="camera" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+<canvas id="capture" style="display:none;"></canvas>
+<button id="toggleBtn" disabled>Mulai</button>
+<div id="status">Memuat model deteksi...</div>
+
+<script>
+const video = document.getElementById('camera');
+const overlay = document.getElementById('overlay');
+const captureCanvas = document.getElementById('capture');
+const statusEl = document.getElementById('status');
+const toggleBtn = document.getElementById('toggleBtn');
+
+let model = null;
+let streaming = false;
+let detectIntervalId = null;
+let snapshotIntervalId = null;
+
+const SNAPSHOT_INTERVAL_MS = 3000;  // kirim foto rutin tiap 3 detik
+const DETECT_INTERVAL_MS = 1000;    // cek orang tiap 1 detik, kirim tiap kali ketemu
+
+async function loadModel() {
+  try {
+    model = await cocoSsd.load();
+    statusEl.textContent = "Model siap. Tekan Mulai.";
+    toggleBtn.disabled = false;
+  } catch (err) {
+    statusEl.textContent = "Gagal load model: " + err.message;
+  }
+}
+
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await new Promise(resolve => { video.onloadedmetadata = resolve; });
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+}
+
+function captureFrame() {
+  captureCanvas.width = video.videoWidth;
+  captureCanvas.height = video.videoHeight;
+  const ctx = captureCanvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+  return captureCanvas.toDataURL('image/jpeg', 0.7);
+}
+
+function sendToTelegram(imageDataUrl, caption) {
+  const payload = { image: imageDataUrl };
+  if (caption) payload.caption = caption;
+
+  fetch('/.netlify/functions/send-snapshot', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).catch(err => console.error(err));
+}
+
+// loop 1: kirim snapshot biasa tiap SNAPSHOT_INTERVAL_MS, tanpa caption
+function startSnapshotLoop() {
+  snapshotIntervalId = setInterval(() => {
+    if (!streaming || !video.videoWidth) return;
+    const imageDataUrl = captureFrame();
+    sendToTelegram(imageDataUrl, null);
+  }, SNAPSHOT_INTERVAL_MS);
+}
+
+// loop 2: cek orang tiap DETECT_INTERVAL_MS, kirim alert SETIAP KALI ketemu, tanpa cooldown
+async function runDetection() {
+  if (!streaming || !video.videoWidth) return;
+
+  const predictions = await model.detect(video);
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+  const people = predictions.filter(p => p.class === 'person' && p.score > 0.6);
+
+  people.forEach(p => {
+    const [x, y, w, h] = p.bbox;
+    ctx.strokeStyle = '#ff3b30';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = '#ff3b30';
+    ctx.font = '16px sans-serif';
+    ctx.fillText(`Orang ${Math.round(p.score * 100)}%`, x, y > 20 ? y - 6 : y + 16);
+  });
+
+  if (people.length > 0) {
+    const imageDataUrl = captureFrame();
+    sendToTelegram(imageDataUrl, "ADA ORANG TERDETEKSI‼️‼️");
+    statusEl.textContent = `Orang terdeteksi! Alert terkirim ${new Date().toLocaleTimeString('id-ID')}`;
+  } else {
+    statusEl.textContent = `Monitoring... (${new Date().toLocaleTimeString('id-ID')})`;
+  }
+}
+
+function startDetectLoop() {
+  detectIntervalId = setInterval(runDetection, DETECT_INTERVAL_MS);
+}
+
+toggleBtn.addEventListener('click', async () => {
+  if (!streaming) {
+    try {
+      await startCamera();
+      streaming = true;
+      toggleBtn.textContent = "Berhenti";
+      startDetectLoop();
+      startSnapshotLoop();
+    } catch (err) {
+      statusEl.textContent = "Gagal akses kamera: " + err.message;
+    }
+  } else {
+    streaming = false;
+    clearInterval(detectIntervalId);
+    clearInterval(snapshotIntervalId);
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach(track => track.stop());
+    }
+    toggleBtn.textContent = "Mulai";
+    statusEl.textContent = "Dihentikan";
+    overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+  }
+});
+
+loadModel();
+</script>
+
+</body>
+  </html>
